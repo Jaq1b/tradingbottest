@@ -491,7 +491,19 @@ class AlpacaBroker:
         }
         
         self._test_connection()
-    
+      
+    def get_actual_position_quantity(self, symbol: str) -> float:
+        """Get the exact quantity we own for a symbol from Alpaca"""
+        try:
+            positions = self.get_positions()
+            for pos in positions:
+                if pos['symbol'] == symbol:
+                    return float(pos['qty'])
+            return 0.0
+        except Exception as e:
+            logger.error(f"Error getting actual position for {symbol}: {e}")
+            return 0.0
+        
     def _test_connection(self):
         try:
             account = self.get_account()
@@ -817,6 +829,8 @@ class TradingBot:
 
 
     
+   # Fix for crypto precision issues in execute_sell method
+
     def execute_sell(self, symbol: str, reason: str):
         if symbol not in self.active_positions:
             return False
@@ -837,12 +851,45 @@ class TradingBot:
         if hold_time < self.min_hold_time:
             return False
         
-        order = Order(symbol=symbol, order_type=OrderType.SELL, quantity=position['quantity'], asset_class=asset_class)
+        # *** NEW: GET ACTUAL ALPACA POSITION FOR CRYPTO ***
+        sell_quantity = position['quantity']
         
-        pnl = (current_price - position['entry_price']) * position['quantity']
+        if asset_class == "crypto":
+            # Get actual position from Alpaca for crypto
+            alpaca_positions = self.broker.get_positions()
+            actual_position = None
+            
+            for pos in alpaca_positions:
+                if pos['symbol'] == symbol:
+                    actual_position = float(pos['qty'])
+                    break
+            
+            if actual_position is None or actual_position <= 0:
+                logger.warning(f"No actual {symbol} position found in Alpaca account")
+                # Clean up our tracking
+                del self.active_positions[symbol]
+                return False
+            
+            # Use actual position (which accounts for fees, rounding, etc.)
+            sell_quantity = actual_position
+            
+            # Log the difference if significant
+            tracked_qty = position['quantity']
+            diff = abs(tracked_qty - actual_position)
+            if diff > 0.001:  # More than 0.001 difference
+                diff_value = diff * current_price
+                logger.info(f"Position adjustment for {symbol}: "
+                        f"Tracked={tracked_qty:.6f}, Actual={actual_position:.6f}, "
+                        f"Diff=${diff_value:.2f}")
+        
+        order = Order(symbol=symbol, order_type=OrderType.SELL, 
+                    quantity=sell_quantity, asset_class=asset_class)
+        
+        pnl = (current_price - position['entry_price']) * sell_quantity  # Use actual quantity for P&L
         pnl_pct = (current_price - position['entry_price']) / position['entry_price'] * 100
         
-        logger.info(f"SELL {symbol} ({asset_class}): {position['quantity']:.4f} @ ${current_price:.2f} | P&L: ${pnl:.2f} ({pnl_pct:.1f}%) | {reason}")
+        logger.info(f"SELL {symbol} ({asset_class}): {sell_quantity:.4f} @ ${current_price:.2f} | "
+                f"P&L: ${pnl:.2f} ({pnl_pct:.1f}%) | {reason}")
         
         if self.broker.place_order(order):
             trade = position['trade']
@@ -852,6 +899,9 @@ class TradingBot:
             trade.pnl = pnl
             trade.pnl_pct = pnl_pct
             trade.exit_reason = reason
+            
+            # Update trade with actual sold quantity
+            trade.quantity = sell_quantity
             
             self.memory.update_trade(trade, position['trade_id'])
             
@@ -870,6 +920,8 @@ class TradingBot:
             return True
         
         return False
+
+
     
     def check_stop_losses(self):
         for symbol, position in list(self.active_positions.items()):
