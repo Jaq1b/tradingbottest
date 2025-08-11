@@ -12,6 +12,8 @@ from enum import Enum
 import os
 import pytz
 from pathlib import Path
+from decimal import Decimal, ROUND_DOWN
+
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,15 +48,6 @@ class MarketHours:
                 return True
         
         return (month, day) in holidays
-    
-    def get_market_status_message(self) -> str:
-        cst_now = datetime.now(self.cst)
-        stock_open = self.is_stock_market_open()
-        
-        status = f"Market Status (CST: {cst_now.strftime('%I:%M %p, %A %m/%d/%Y')}):\n"
-        status += f"  📈 Stocks: {'OPEN' if stock_open else 'CLOSED'}\n"
-        status += f"  ₿ Crypto: OPEN"
-        return status
 
 class OrderType(Enum):
     BUY = "buy"
@@ -81,10 +74,10 @@ class Trade:
     pnl_pct: float = 0.0
     exit_reason: Optional[str] = None
     strategy_signals: Optional[str] = None
+    actual_quantity: Optional[float] = None
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'Trade':
-        # Remove trade_id if it exists since it's not a field in the Trade class
         trade_data = data.copy()
         trade_data.pop('trade_id', None)
         return cls(**trade_data)
@@ -183,10 +176,10 @@ class FileMemory:
                 open_trades[trade.symbol] = (trade, trade_id)
         
         return open_trades
+    
     def get_trade_history(self, days: int = 30) -> List[Trade]:
         trades = self._load_json(self.trades_file)
         
-        # Get cutoff datetime
         cutoff_datetime = datetime.now() - timedelta(days=days)
         cutoff_date_str = cutoff_datetime.strftime('%Y-%m-%d')
         
@@ -194,13 +187,11 @@ class FileMemory:
         for trade_data in trades:
             try:
                 trade_timestamp = trade_data.get('timestamp', '')
-                # Extract date part from ISO timestamp (YYYY-MM-DD)
                 trade_date = trade_timestamp[:10] if len(trade_timestamp) >= 10 else ''
                 
                 if trade_date >= cutoff_date_str:
                     filtered_trades.append(Trade.from_dict(trade_data))
             except Exception as e:
-                # Skip malformed trade data
                 continue
     
         return sorted(filtered_trades, key=lambda x: x.timestamp, reverse=True)
@@ -216,16 +207,6 @@ class FileMemory:
         state.update(kwargs)
         state['last_update'] = datetime.now().isoformat()
         self._save_json(self.bot_state_file, state)
-    
-    def save_daily_performance(self, date: str, daily_pnl: float, daily_trades: int, 
-                             win_rate: float, portfolio_value: float, drawdown: float):
-        performance = self._load_json(self.performance_file)
-        performance[date] = {
-            'daily_pnl': daily_pnl, 'daily_trades': daily_trades, 'win_rate': win_rate,
-            'portfolio_value': portfolio_value, 'drawdown': drawdown,
-            'timestamp': datetime.now().isoformat()
-        }
-        self._save_json(self.performance_file, performance)
     
     def get_recent_performance(self, symbol: str, days: int = 7) -> List[Trade]:
         trades = self._load_json(self.trades_file)
@@ -266,22 +247,22 @@ class TechnicalIndicators:
         histogram = macd_line - signal_line
         return macd_line, signal_line, histogram
 
-class TradingStrategy:
+class AggressiveStrategy:
     def __init__(self, memory: FileMemory):
         self.memory = memory
         self.last_signal_time = {}
-        self.signal_cooldown = 900  # 15 minutes
+        self.signal_cooldown = 120  # 2 minutes - more aggressive
     
     def analyze_market(self, data: pd.DataFrame, symbol: str, asset_class: str = "stock") -> Dict:
-        if len(data) < 50:
+        if len(data) < 30:  # Reduced from 50 for more aggressive trading
             return {"insufficient_data": True}
         
         current_price = data['Close'].iloc[-1]
         
-        # RSI with asset class thresholds
-        rsi = TechnicalIndicators.rsi(data['Close'])
-        oversold_threshold = 25 if asset_class == "crypto" else 30
-        overbought_threshold = 75 if asset_class == "crypto" else 70
+        # More aggressive RSI thresholds
+        rsi = TechnicalIndicators.rsi(data['Close'], 10)  # Faster RSI
+        oversold_threshold = 35 if asset_class == "crypto" else 35
+        overbought_threshold = 65 if asset_class == "crypto" else 65
             
         analysis = {
             'symbol': symbol, 'asset_class': asset_class, 'price': current_price,
@@ -292,8 +273,8 @@ class TradingStrategy:
             }
         }
         
-        # MACD
-        macd_line, signal_line, histogram = TechnicalIndicators.macd(data['Close'])
+        # Faster MACD
+        macd_line, signal_line, histogram = TechnicalIndicators.macd(data['Close'], 8, 21, 5)
         analysis['macd'] = {
             'line': macd_line.iloc[-1] if not macd_line.empty else 0,
             'signal': signal_line.iloc[-1] if not signal_line.empty else 0,
@@ -308,27 +289,27 @@ class TradingStrategy:
             analysis['macd']['bullish_cross'] = (prev_macd <= prev_signal) and (curr_macd > curr_signal)
             analysis['macd']['bearish_cross'] = (prev_macd >= prev_signal) and (curr_macd < curr_signal)
         
-        # Moving Averages
+        # Faster moving averages
+        sma_10 = TechnicalIndicators.sma(data['Close'], 10)
         sma_20 = TechnicalIndicators.sma(data['Close'], 20)
-        sma_50 = TechnicalIndicators.sma(data['Close'], 50)
         
         analysis['sma'] = {
+            'sma_10': sma_10.iloc[-1] if not sma_10.empty else current_price,
             'sma_20': sma_20.iloc[-1] if not sma_20.empty else current_price,
-            'sma_50': sma_50.iloc[-1] if not sma_50.empty else current_price,
+            'above_sma_10': current_price > sma_10.iloc[-1] if not sma_10.empty else False,
             'above_sma_20': current_price > sma_20.iloc[-1] if not sma_20.empty else False,
-            'above_sma_50': current_price > sma_50.iloc[-1] if not sma_50.empty else False,
             'sma_cross_up': False, 'sma_cross_down': False
         }
         
-        if len(sma_20) >= 2 and len(sma_50) >= 2:
-            analysis['sma']['sma_cross_up'] = (sma_20.iloc[-2] <= sma_50.iloc[-2]) and (sma_20.iloc[-1] > sma_50.iloc[-1])
-            analysis['sma']['sma_cross_down'] = (sma_20.iloc[-2] >= sma_50.iloc[-2]) and (sma_20.iloc[-1] < sma_50.iloc[-1])
+        if len(sma_10) >= 2 and len(sma_20) >= 2:
+            analysis['sma']['sma_cross_up'] = (sma_10.iloc[-2] <= sma_20.iloc[-2]) and (sma_10.iloc[-1] > sma_20.iloc[-1])
+            analysis['sma']['sma_cross_down'] = (sma_10.iloc[-2] >= sma_20.iloc[-2]) and (sma_10.iloc[-1] < sma_20.iloc[-1])
         
         # Volume analysis
-        if len(data) >= 20:
-            avg_volume = data['Volume'].rolling(20).mean().iloc[-1]
+        if len(data) >= 10:
+            avg_volume = data['Volume'].rolling(10).mean().iloc[-1]
             current_volume = data['Volume'].iloc[-1]
-            volume_multiplier = 2.0 if asset_class == "crypto" else 1.5
+            volume_multiplier = 1.3 if asset_class == "crypto" else 1.2  # Lower threshold
             analysis['volume'] = {
                 'current': current_volume, 'average': avg_volume,
                 'high_volume': current_volume > (avg_volume * volume_multiplier)
@@ -344,10 +325,10 @@ class TradingStrategy:
         if analysis.get('insufficient_data'):
             return False, "Insufficient data", 0.0
         
-        # Check recent performance
+        # Less restrictive recent performance check
         recent_trades = self.memory.get_recent_performance(symbol, days=1)
         recent_losses = sum(1 for trade in recent_trades if trade.pnl < 0)
-        if recent_losses >= 3:
+        if recent_losses >= 5:  # Allow more losses before stopping
             return False, f"Too many recent losses ({recent_losses})", 0.0
         
         # Signal cooldown
@@ -359,48 +340,47 @@ class TradingStrategy:
         buy_signals = []
         buy_score = 0
         
-        # RSI signals
+        # More aggressive RSI signals
         if analysis['rsi']['oversold']:
             buy_signals.append("RSI oversold")
-            buy_score += 3
-        elif analysis['rsi']['value'] < 40:
-            buy_signals.append("RSI trending down")
+            buy_score += 2
+        elif analysis['rsi']['value'] < 45:
+            buy_signals.append("RSI moderate")
             buy_score += 1
         
         # MACD signals
         if analysis['macd']['bullish_cross']:
-            buy_signals.append("MACD bullish crossover")
-            buy_score += 4
+            buy_signals.append("MACD bullish cross")
+            buy_score += 3
         elif analysis['macd']['histogram'] > 0:
-            buy_signals.append("MACD positive momentum")
+            buy_signals.append("MACD positive")
             buy_score += 1
         
         # Moving average signals
-        if analysis['sma']['above_sma_20']:
-            buy_signals.append("Above SMA 20")
-            buy_score += 2
+        if analysis['sma']['above_sma_10']:
+            buy_signals.append("Above SMA 10")
+            buy_score += 1
         
         if analysis['sma']['sma_cross_up']:
-            buy_signals.append("SMA golden cross")
-            buy_score += 3
+            buy_signals.append("SMA cross up")
+            buy_score += 2
         
         # Volume confirmation
         if analysis['volume']['high_volume']:
             buy_signals.append("High volume")
-            weight = 2 if asset_class == "crypto" else 1
-            buy_score += weight
+            buy_score += 1
         
-        # Calculate stop loss
+        # Calculate tighter stop loss for smaller positions
         current_price = analysis['price']
-        stop_loss = current_price * (0.95 if asset_class == "crypto" else 0.96)
+        stop_loss = current_price * (0.97 if asset_class == "crypto" else 0.98)  # Tighter stops
         
-        required_score = 2 if asset_class == "crypto" else 3
+        required_score = 2  # Lower threshold for more trades
         
         if buy_score >= required_score:
             self.last_signal_time[symbol] = current_time
-            return True, f"BUY signals: {', '.join(buy_signals)} (Score: {buy_score})", stop_loss
+            return True, f"BUY: {', '.join(buy_signals)} (Score: {buy_score})", stop_loss
         
-        return False, f"Weak buy signals: {', '.join(buy_signals)} (Score: {buy_score})", 0.0
+        return False, f"Weak buy: {', '.join(buy_signals)} (Score: {buy_score})", 0.0
     
     def should_sell(self, data: pd.DataFrame, symbol: str, entry_price: float = None, asset_class: str = "stock") -> Tuple[bool, str]:
         analysis = self.analyze_market(data, symbol, asset_class)
@@ -420,55 +400,55 @@ class TradingStrategy:
         # RSI signals
         if analysis['rsi']['overbought']:
             sell_signals.append("RSI overbought")
-            sell_score += 3
-        elif analysis['rsi']['value'] > 60:
-            sell_signals.append("RSI trending up")
+            sell_score += 2
+        elif analysis['rsi']['value'] > 55:
+            sell_signals.append("RSI high")
             sell_score += 1
         
         # MACD signals
         if analysis['macd']['bearish_cross']:
-            sell_signals.append("MACD bearish crossover")
-            sell_score += 4
+            sell_signals.append("MACD bearish cross")
+            sell_score += 3
         elif analysis['macd']['histogram'] < 0:
-            sell_signals.append("MACD negative momentum")
+            sell_signals.append("MACD negative")
             sell_score += 1
         
         # Moving average signals
-        if not analysis['sma']['above_sma_20']:
-            sell_signals.append("Below SMA 20")
-            sell_score += 2
+        if not analysis['sma']['above_sma_10']:
+            sell_signals.append("Below SMA 10")
+            sell_score += 1
         
         if analysis['sma']['sma_cross_down']:
-            sell_signals.append("SMA death cross")
-            sell_score += 3
+            sell_signals.append("SMA cross down")
+            sell_score += 2
         
-        # Profit taking
+        # Quick profit taking for small positions
         if entry_price:
             current_price = analysis['price']
             profit_pct = (current_price - entry_price) / entry_price * 100
             
             if asset_class == "crypto":
-                if profit_pct > 8:
+                if profit_pct > 4:  # Take profits faster
                     sell_signals.append(f"Take profit ({profit_pct:.1f}%)")
-                    sell_score += 3
-                elif profit_pct > 4:
-                    sell_signals.append(f"Partial profit ({profit_pct:.1f}%)")
+                    sell_score += 2
+                elif profit_pct > 2:
+                    sell_signals.append(f"Small profit ({profit_pct:.1f}%)")
                     sell_score += 1
             else:
-                if profit_pct > 6:
+                if profit_pct > 3:
                     sell_signals.append(f"Take profit ({profit_pct:.1f}%)")
-                    sell_score += 3
-                elif profit_pct > 3:
-                    sell_signals.append(f"Partial profit ({profit_pct:.1f}%)")
+                    sell_score += 2
+                elif profit_pct > 1.5:
+                    sell_signals.append(f"Small profit ({profit_pct:.1f}%)")
                     sell_score += 1
         
-        required_score = 2 if asset_class == "crypto" else 3
+        required_score = 2  # Lower threshold
         
         if sell_score >= required_score:
             self.last_signal_time[symbol] = current_time
-            return True, f"SELL signals: {', '.join(sell_signals)} (Score: {sell_score})"
+            return True, f"SELL: {', '.join(sell_signals)} (Score: {sell_score})"
         
-        return False, f"Weak sell signals: {', '.join(sell_signals)} (Score: {sell_score})"
+        return False, f"Weak sell: {', '.join(sell_signals)} (Score: {sell_score})"
 
 class AlpacaBroker:
     def __init__(self, api_key: str, secret_key: str, paper_trading: bool = True):
@@ -493,23 +473,30 @@ class AlpacaBroker:
         self._test_connection()
       
     def get_actual_position_quantity(self, symbol: str) -> float:
-        """Get the exact quantity we own for a symbol from Alpaca"""
-        try:
-            positions = self.get_positions()
-            for pos in positions:
-                if pos['symbol'] == symbol:
-                    return float(pos['qty'])
-            return 0.0
-        except Exception as e:
-            logger.error(f"Error getting actual position for {symbol}: {e}")
-            return 0.0
+            """Get the actual position quantity from Alpaca, handling crypto precision"""
+            try:
+                positions = self.get_positions()
+                for pos in positions:
+                    if pos['symbol'] == symbol:
+                        qty = float(pos['qty'])
+                        # For crypto, ensure we have enough precision
+                        if symbol.endswith('/USD') and qty > 0:
+                            # Round down to avoid precision issues
+                            if qty < 1:
+                                return float(Decimal(str(qty)).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN))
+                            else:
+                                return float(Decimal(str(qty)).quantize(Decimal('0.00001'), rounding=ROUND_DOWN))
+                        return qty
+                return 0.0
+            except Exception as e:
+                logger.error(f"Error getting actual position for {symbol}: {e}")
+                return 0.0
         
     def _test_connection(self):
         try:
             account = self.get_account()
             if account and 'account_number' in account:
                 logger.info(f"Connected to Alpaca successfully")
-                logger.info(f"Account: {account.get('account_number', 'N/A')}")
                 logger.info(f"Buying power: ${float(account.get('buying_power', 0)):,.2f}")
                 return True
             else:
@@ -525,7 +512,7 @@ class AlpacaBroker:
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.error(f"Account request failed: {response.status_code} - {response.text}")
+                logger.error(f"Account request failed: {response.status_code}")
                 response.raise_for_status()
         except requests.exceptions.RequestException as e:
             logger.error(f"Error getting account info: {e}")
@@ -542,37 +529,68 @@ class AlpacaBroker:
             logger.debug(f"Price lookup failed for {symbol}: {e}")
         return 0.0
     
-    def get_bars(self, symbol: str, timeframe: str = "15Min", limit: int = 200) -> pd.DataFrame:
+    def get_bars(self, symbol: str, timeframe: str = "5Min", limit: int = 100) -> pd.DataFrame:
         try:
             yf_symbol = symbol.replace('/USD', '-USD') if symbol.endswith('/USD') else symbol
             ticker = yf.Ticker(yf_symbol)
-            # Use shorter period for crypto to avoid delisting issues
-            period = "30d" if symbol.endswith('/USD') else "60d"
-            data = ticker.history(period=period, interval="15m")
+            period = "10d" if symbol.endswith('/USD') else "30d"
+            data = ticker.history(period=period, interval="5m")  # 5 minute bars for more aggressive
             if not data.empty:
                 return data.tail(limit)
         except Exception as e:
             logger.debug(f"Bars failed for {symbol}: {e}")
         return pd.DataFrame()
-    
-    def place_order(self, order: Order) -> bool:
+    def get_order_details(self, order_id: str) -> Dict:
+        """Get details of a specific order"""
         try:
-            # Crypto orders need different time_in_force
-            time_in_force = "gtc" if order.asset_class == "crypto" else "day"
-            
-            order_data = {
-                "symbol": order.symbol,
-                "qty": str(order.quantity),
-                "side": order.order_type.value,
-                "type": "market",
-                "time_in_force": time_in_force
-            }
-            
-            # Handle fractional crypto orders
-            if order.asset_class == "crypto" and order.quantity < 1:
-                current_price = self.get_current_price(order.symbol)
-                if current_price > 0:
-                    notional = order.quantity * current_price
+            response = requests.get(f"{self.base_url}/v2/orders/{order_id}", headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Order details request failed: {response.status_code}")
+                return {}
+        except Exception as e:
+            logger.error(f"Error getting order details: {e}")
+            return {}
+    
+    def wait_for_order_fill(self, order_id: str, timeout: int = 30) -> Dict:
+        """Wait for order to fill and return final status"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            order_details = self.get_order_details(order_id)
+            if order_details:
+                status = order_details.get('status', '')
+                if status in ['filled', 'partially_filled', 'cancelled', 'rejected']:
+                    return order_details
+            time.sleep(1)
+        
+        # Return last known status
+        return self.get_order_details(order_id)
+    
+
+    def place_order(self, order: Order) -> bool:
+            """Place order with improved crypto handling"""
+            try:
+                time_in_force = "gtc" if order.asset_class == "crypto" else "day"
+                
+                if order.asset_class == "crypto":
+                    # For crypto, always use notional orders for more precise control
+                    current_price = self.get_current_price(order.symbol)
+                    if current_price <= 0:
+                        logger.error(f"Cannot get price for {order.symbol}")
+                        return False
+                    
+                    # Calculate notional value
+                    if order.notional:
+                        notional = order.notional
+                    else:
+                        notional = order.quantity * current_price
+                    
+                    # Ensure minimum notional ($1 for most cryptos)
+                    if notional < 1.0:
+                        logger.error(f"Notional value too small: ${notional:.2f}")
+                        return False
+                    
                     order_data = {
                         "symbol": order.symbol,
                         "notional": str(round(notional, 2)),
@@ -580,23 +598,46 @@ class AlpacaBroker:
                         "type": "market",
                         "time_in_force": time_in_force
                     }
-            
-            response = requests.post(f"{self.base_url}/v2/orders", headers=self.headers, json=order_data, timeout=10)
-            
-            if response.status_code in [200, 201]:
-                result = response.json()
-                order.order_id = result['id']
-                order.status = OrderStatus.PENDING
-                logger.info(f"Order placed: {order.order_type.value.upper()} {order.quantity} {order.symbol}")
-                return True
-            else:
-                logger.error(f"Order failed: {response.status_code} - {response.text}")
+                else:
+                    # For stocks, use quantity-based orders
+                    order_data = {
+                        "symbol": order.symbol,
+                        "qty": str(int(order.quantity)),
+                        "side": order.order_type.value,
+                        "type": "market",
+                        "time_in_force": time_in_force
+                    }
+                
+                logger.info(f"Placing {order.order_type.value.upper()} order for {order.symbol}: {order_data}")
+                
+                response = requests.post(f"{self.base_url}/v2/orders", headers=self.headers, json=order_data, timeout=10)
+                
+                if response.status_code in [200, 201]:
+                    result = response.json()
+                    order.order_id = result['id']
+                    order.status = OrderStatus.PENDING
+                    logger.info(f"Order placed successfully: {order.order_id}")
+                    
+                    # For crypto, wait for fill to get actual quantity
+                    if order.asset_class == "crypto":
+                        fill_details = self.wait_for_order_fill(order.order_id, timeout=15)
+                        if fill_details and fill_details.get('status') == 'filled':
+                            filled_qty = float(fill_details.get('filled_qty', 0))
+                            if filled_qty > 0:
+                                order.quantity = filled_qty
+                                logger.info(f"Crypto order filled: {filled_qty} {order.symbol}")
+                            else:
+                                logger.warning(f"Crypto order filled but no quantity returned")
+                    
+                    return True
+                else:
+                    logger.error(f"Order failed: {response.status_code} - {response.text}")
+                    return False
+                
+            except Exception as e:
+                logger.error(f"Error placing order: {e}")
                 return False
-            
-        except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            return False
-    
+        
     def get_positions(self) -> List[Dict]:
         try:
             response = requests.get(f"{self.base_url}/v2/positions", headers=self.headers, timeout=10)
@@ -608,90 +649,106 @@ class AlpacaBroker:
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
             return []
+   
 
-class TradingBot:
+class AggressiveTradingBot:
     def __init__(self, broker: AlpacaBroker, initial_capital: float = 1000.0, data_dir: str = "trading_data"):
         self.broker = broker
         self.initial_capital = initial_capital
         self.market_hours = MarketHours()
         self.memory = FileMemory(data_dir)
         
-        # Daily spending limits (hardcoded)
-        self.daily_crypto_limit = 1000.0  # $1000 per day for crypto
-        self.daily_stock_limit = 2000.0   # $2000 per day for stocks
+        # HIGHER DAILY LIMITS - MORE AGGRESSIVE
+        self.daily_crypto_limit = 2500.0   # $2500 per day for crypto (up from $1000)
+        self.daily_stock_limit = 5000.0    # $5000 per day for stocks (up from $2000)
         
-        # Trading symbols
-        self.stock_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "SPY", "QQQ", "IWM", "NFLX", "AMD", "CRM", "UBER"]
-        # Updated crypto symbols - more conservative list of stable cryptos on Alpaca
-        self.crypto_symbols = [
-            "BTC/USD",   # Bitcoin
-            "ETH/USD",   # Ethereum  
-            "LTC/USD",   # Litecoin
-            "BCH/USD",   # Bitcoin Cash
-            "LINK/USD",  # Chainlink
-            "AAVE/USD"   # Aave - removing others that may be delisted
-        ]
+        # More diverse and aggressive symbol selection
+        self.stock_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "AMD", 
+                             "CRM", "UBER", "SPY", "QQQ", "IWM", "NFLX", "BABA", "PYPL", "SQ", "ROKU"]
+        self.crypto_symbols = ["BTC/USD", "ETH/USD", "LTC/USD", "BCH/USD", "LINK/USD", "AAVE/USD"]
         self.symbols = self.stock_symbols + self.crypto_symbols
         
-        self.strategy = TradingStrategy(self.memory)
+        self.strategy = AggressiveStrategy(self.memory)
         
-        # Trading parameters
-        self.check_interval = 180  # 3 minutes
-        self.max_positions = 8
-        self.min_hold_time = 180  # 3 minutes
-        # Reduced risk by 1% for both asset classes
-        self.crypto_risk_per_trade = 0.02  # 2% risk per crypto trade (down from 3%)
-        self.stock_risk_per_trade = 0.02   # 2% risk per stock trade (down from 3%)
+        # AGGRESSIVE PARAMETERS
+        self.check_interval = 60        # 1 minute checks
+        self.max_positions = 12         # More positions
+        self.min_hold_time = 60         # 1 minute minimum hold
+        self.crypto_risk_per_trade = 0.01   # 1% risk per trade - SMALLER AMOUNTS
+        self.stock_risk_per_trade = 0.01    # 1% risk per trade - SMALLER AMOUNTS
         
         self.active_positions = {}
         self._restore_state()
         
-        # Performance tracking
         bot_state = self.memory.get_bot_state()
         self.total_pnl = bot_state.get('total_pnl', 0.0)
         self.total_trades = bot_state.get('total_trades', 0)
         self.winning_trades = bot_state.get('winning_trades', 0)
         
-        logger.info(f"Trading bot initialized: {len(self.stock_symbols)} stocks + {len(self.crypto_symbols)} cryptos")
+        logger.info(f"🚀 AGGRESSIVE TRADING BOT INITIALIZED 🚀")
+        logger.info(f"Symbols: {len(self.stock_symbols)} stocks + {len(self.crypto_symbols)} cryptos")
         logger.info(f"Daily limits: Crypto ${self.daily_crypto_limit:,}, Stocks ${self.daily_stock_limit:,}")
-        logger.info(f"Risk per trade: Crypto {self.crypto_risk_per_trade*100:.0f}%, Stocks {self.stock_risk_per_trade*100:.0f}%")
+        logger.info(f"Risk per trade: {self.crypto_risk_per_trade*100:.0f}% (SMALL POSITIONS)")
     
     def _get_asset_class(self, symbol: str) -> str:
         return "crypto" if symbol in self.crypto_symbols else "stock"
     
     def _restore_state(self):
-        memory_positions = self.memory.get_open_trades()
-        alpaca_positions = self.broker.get_positions()
-        alpaca_symbols = {pos['symbol']: pos for pos in alpaca_positions if float(pos['qty']) != 0}
-        
-        self.active_positions = {}
-        
-        for symbol, (trade, trade_id) in memory_positions.items():
-            if symbol in alpaca_symbols:
-                self.active_positions[symbol] = {
-                    'trade': trade, 'trade_id': trade_id, 'quantity': trade.quantity,
-                    'entry_price': trade.entry_price, 'stop_loss': trade.stop_loss,
-                    'timestamp': datetime.fromisoformat(trade.timestamp),
-                    'asset_class': trade.asset_class
-                }
-        
-        logger.info(f"Restored {len(self.active_positions)} positions")
+            """Improved state restoration with better crypto position handling"""
+            memory_positions = self.memory.get_open_trades()
+            alpaca_positions = self.broker.get_positions()
+            alpaca_symbols = {pos['symbol']: pos for pos in alpaca_positions if float(pos['qty']) != 0}
+            
+            self.active_positions = {}
+            ghost_positions = []
+            restored_positions = []
+            
+            # Clean restore - only load positions that exist in both places
+            for symbol, (trade, trade_id) in memory_positions.items():
+                if symbol in alpaca_symbols:
+                    alpaca_pos = alpaca_symbols[symbol]
+                    actual_qty = float(alpaca_pos['qty'])
+                    
+                    # For crypto, update the trade quantity to match actual position
+                    if self._get_asset_class(symbol) == "crypto":
+                        if abs(actual_qty - trade.quantity) > 0.0001:  # Allow for small differences
+                            logger.info(f"Updating {symbol} quantity: {trade.quantity:.6f} -> {actual_qty:.6f}")
+                            trade.quantity = actual_qty
+                            trade.actual_quantity = actual_qty
+                            self.memory.update_trade(trade, trade_id)
+                    
+                    self.active_positions[symbol] = {
+                        'trade': trade, 'trade_id': trade_id, 'quantity': actual_qty,
+                        'entry_price': trade.entry_price, 'stop_loss': trade.stop_loss,
+                        'timestamp': datetime.fromisoformat(trade.timestamp),
+                        'asset_class': trade.asset_class
+                    }
+                    restored_positions.append(symbol)
+                else:
+                    ghost_positions.append((symbol, trade, trade_id))
+            
+            # Auto-close ghost positions (positions in memory but not in Alpaca)
+            for symbol, trade, trade_id in ghost_positions:
+                trade.exit_price = trade.entry_price
+                trade.exit_timestamp = datetime.now().isoformat()
+                trade.status = "closed"
+                trade.pnl = 0.0
+                trade.pnl_pct = 0.0
+                trade.exit_reason = "Position not found - auto-closed"
+                self.memory.update_trade(trade, trade_id)
+            
+            logger.info(f"Restored {len(restored_positions)} positions, cleaned {len(ghost_positions)} ghosts")
+            if restored_positions:
+                logger.info(f"Active positions: {', '.join(restored_positions)}")
     
     def get_daily_spending(self, asset_class: str) -> float:
-        """Calculate how much has been spent today on a specific asset class"""
-        from datetime import datetime
-        
-        today = datetime.now().strftime('%Y-%m-%d')  # "2025-08-04"
+        today = datetime.now().strftime('%Y-%m-%d')
         all_trades = self.memory.get_trade_history(days=1)
         
         daily_spending = 0.0
-        today_trades = []
-        
         for trade in all_trades:
             try:
-                # Parse the ISO timestamp and extract date
                 if hasattr(trade, 'timestamp') and trade.timestamp:
-                    # Handle both ISO format "2025-08-04T01:20:10.123456" and simple format
                     trade_date = trade.timestamp.split('T')[0] if 'T' in trade.timestamp else trade.timestamp[:10]
                     
                     if (trade_date == today and 
@@ -700,46 +757,16 @@ class TradingBot:
                         
                         trade_value = trade.entry_price * trade.quantity
                         daily_spending += trade_value
-                        today_trades.append({
-                            'symbol': trade.symbol,
-                            'value': trade_value,
-                            'timestamp': trade.timestamp
-                        })
-            except Exception as e:
-                # Skip malformed trades
+            except Exception:
                 continue
-        
-        # Debug logging to see what's being counted
-        if today_trades:
-            logger.info(f"Today's {asset_class} trades found: {len(today_trades)} trades totaling ${daily_spending:.0f}")
-            for t in today_trades[:3]:  # Show first 3 trades
-                logger.info(f"  {t['symbol']}: ${t['value']:.0f} at {t['timestamp']}")
-        else:
-            logger.info(f"No {asset_class} trades found for today ({today})")
         
         return daily_spending
     
-    def can_afford_trade(self, symbol: str, position_value: float, asset_class: str) -> Tuple[bool, str]:
-        """Check if trade is within daily spending limits"""
-        daily_spending = self.get_daily_spending(asset_class)
-        
-        if asset_class == "crypto":
-            limit = self.daily_crypto_limit
-            if daily_spending + position_value > limit:
-                return False, f"Crypto daily limit exceeded: ${daily_spending:.0f}/${limit:.0f} used"
-        else:  # stocks
-            limit = self.daily_stock_limit
-            if daily_spending + position_value > limit:
-                return False, f"Stock daily limit exceeded: ${daily_spending:.0f}/${limit:.0f} used"
-        
-        return True, f"Within limits: ${daily_spending:.0f}/${limit:.0f} used"
-    
     def calculate_position_size(self, symbol: str, entry_price: float, stop_loss: float, asset_class: str) -> float:
-        """Calculate position size using different risk levels for crypto vs stocks"""
         account = self.broker.get_account()
         buying_power = float(account.get('buying_power', self.initial_capital))
         
-        # Use different risk per trade based on asset class
+        # Small risk per trade
         risk_per_trade = self.crypto_risk_per_trade if asset_class == "crypto" else self.stock_risk_per_trade
         risk_amount = buying_power * risk_per_trade
         
@@ -748,34 +775,28 @@ class TradingBot:
             return 0
         
         position_size = risk_amount / stop_distance
-        max_position_value = buying_power * 0.25
-        max_shares_by_value = max_position_value / entry_price
         
-        if asset_class == "crypto":
-            position_size = min(position_size, max_shares_by_value)
-            min_shares = 10.0 / entry_price  # $10 minimum
-            position_size = max(position_size, min_shares)
-        else:
-            position_size = max(1, int(min(position_size, max_shares_by_value)))
-            position_size = min(position_size, 200)
-        
-        # *** NEW: ENFORCE DAILY LIMITS IN POSITION SIZING ***
+        # Cap by available budget
         daily_spending = self.get_daily_spending(asset_class)
         daily_limit = self.daily_crypto_limit if asset_class == "crypto" else self.daily_stock_limit
         remaining_budget = daily_limit - daily_spending
         
-        # Cap position size by remaining daily budget
+        if remaining_budget < 20:  # Minimum $20 to trade
+            return 0
+        
+        # Ensure position fits in remaining budget
         position_value = position_size * entry_price
         if position_value > remaining_budget:
-            if remaining_budget < 10:  # Not worth trading
-                return 0
-            
-            # Reduce position size to fit remaining budget
             position_size = remaining_budget / entry_price
-            
-            # Ensure minimum viable position
-            if asset_class == "stock":
-                position_size = max(1, int(position_size))
+        
+        # Final size constraints
+        if asset_class == "crypto":
+            min_shares = 15.0 / entry_price  # $15 minimum
+            position_size = max(position_size, min_shares)
+            position_size = min(position_size, 200.0 / entry_price)  # $200 max per crypto trade
+        else:
+            position_size = max(1, int(position_size))
+            position_size = min(position_size, int(300.0 / entry_price))  # $300 max per stock trade
         
         return position_size
     
@@ -788,36 +809,37 @@ class TradingBot:
         if asset_class == "stock" and not self.market_hours.is_stock_market_open():
             return False
         
+        # Check daily limits first
+        daily_spending = self.get_daily_spending(asset_class)
+        daily_limit = self.daily_crypto_limit if asset_class == "crypto" else self.daily_stock_limit
+        
+        if daily_spending >= daily_limit:
+            return False
+        
         position_size = self.calculate_position_size(symbol, current_price, stop_loss, asset_class)
         
         if position_size <= 0:
             return False
         
-        # *** SIMPLE DAILY LIMIT CHECK - Use original get_daily_spending method ***
-        daily_spending = self.get_daily_spending(asset_class)
-        daily_limit = self.daily_crypto_limit if asset_class == "crypto" else self.daily_stock_limit
-        
-        if daily_spending >= daily_limit:
-            logger.info(f"Daily {asset_class} limit reached: ${daily_spending:.0f}/${daily_limit:.0f}")
-            return False
-        
         order = Order(symbol=symbol, order_type=OrderType.BUY, quantity=position_size, asset_class=asset_class)
         
-        logger.info(f"BUY {symbol} ({asset_class}): {position_size:.4f} @ ${current_price:.2f} | {reason}")
-        logger.info(f"Daily spending: ${daily_spending:.0f}/${daily_limit:.0f}")
+        logger.info(f"BUY {symbol}: {position_size:.4f} @ ${current_price:.2f} | {reason}")
         
         if self.broker.place_order(order):
+            # Use actual filled quantity for crypto
+            actual_quantity = order.quantity
+            
             trade = Trade(
-                symbol=symbol, entry_price=current_price, quantity=position_size,
+                symbol=symbol, entry_price=current_price, quantity=actual_quantity,
                 timestamp=datetime.now().isoformat(), stop_loss=stop_loss,
                 asset_class=asset_class, alpaca_order_id=order.order_id,
-                status="open", strategy_signals=reason
+                status="open", strategy_signals=reason, actual_quantity=actual_quantity
             )
             
             trade_id = self.memory.save_trade(trade)
             
             self.active_positions[symbol] = {
-                'trade': trade, 'trade_id': trade_id, 'quantity': position_size,
+                'trade': trade, 'trade_id': trade_id, 'quantity': actual_quantity,
                 'entry_price': current_price, 'stop_loss': stop_loss,
                 'timestamp': datetime.now(), 'asset_class': asset_class
             }
@@ -825,13 +847,9 @@ class TradingBot:
             return True
         
         return False
-
-
-
     
-   # Fix for crypto precision issues in execute_sell method
-
     def execute_sell(self, symbol: str, reason: str):
+        """Improved crypto selling with better position handling"""
         if symbol not in self.active_positions:
             return False
         
@@ -844,6 +862,7 @@ class TradingBot:
         
         current_price = self.broker.get_current_price(symbol)
         if current_price <= 0:
+            logger.error(f"Cannot get current price for {symbol}")
             return False
         
         # Check minimum hold time
@@ -851,45 +870,49 @@ class TradingBot:
         if hold_time < self.min_hold_time:
             return False
         
-        # *** NEW: GET ACTUAL ALPACA POSITION FOR CRYPTO ***
-        sell_quantity = position['quantity']
+        # Get the actual position quantity from Alpaca
+        actual_position = self.broker.get_actual_position_quantity(symbol)
         
-        if asset_class == "crypto":
-            # Get actual position from Alpaca for crypto
-            alpaca_positions = self.broker.get_positions()
-            actual_position = None
-            
-            for pos in alpaca_positions:
-                if pos['symbol'] == symbol:
-                    actual_position = float(pos['qty'])
-                    break
-            
-            if actual_position is None or actual_position <= 0:
-                logger.warning(f"No actual {symbol} position found in Alpaca account")
-                # Clean up our tracking
-                del self.active_positions[symbol]
-                return False
-            
-            # Use actual position (which accounts for fees, rounding, etc.)
-            sell_quantity = actual_position
-            
-            # Log the difference if significant
-            tracked_qty = position['quantity']
-            diff = abs(tracked_qty - actual_position)
-            if diff > 0.001:  # More than 0.001 difference
-                diff_value = diff * current_price
-                logger.info(f"Position adjustment for {symbol}: "
-                        f"Tracked={tracked_qty:.6f}, Actual={actual_position:.6f}, "
-                        f"Diff=${diff_value:.2f}")
+        if actual_position <= 0:
+            logger.warning(f"No actual {symbol} position found in Alpaca, cleaning up memory")
+            # Clean up the position from memory
+            trade = position['trade']
+            trade.exit_price = current_price
+            trade.exit_timestamp = datetime.now().isoformat()
+            trade.status = "closed"
+            trade.pnl = 0.0
+            trade.pnl_pct = 0.0
+            trade.exit_reason = "Position not found - cleaned up"
+            self.memory.update_trade(trade, position['trade_id'])
+            del self.active_positions[symbol]
+            return False
         
-        order = Order(symbol=symbol, order_type=OrderType.SELL, 
-                    quantity=sell_quantity, asset_class=asset_class)
+        sell_quantity = actual_position
         
-        pnl = (current_price - position['entry_price']) * sell_quantity  # Use actual quantity for P&L
+        # For crypto, create a notional sell order if the quantity is very small
+        if asset_class == "crypto" and sell_quantity * current_price < 1.0:
+            notional_value = sell_quantity * current_price
+            order = Order(
+                symbol=symbol, 
+                order_type=OrderType.SELL, 
+                quantity=sell_quantity,
+                notional=notional_value,
+                asset_class=asset_class
+            )
+        else:
+            order = Order(
+                symbol=symbol, 
+                order_type=OrderType.SELL, 
+                quantity=sell_quantity, 
+                asset_class=asset_class
+            )
+        
+        # Calculate P&L using position entry price and actual sell quantity
+        pnl = (current_price - position['entry_price']) * sell_quantity
         pnl_pct = (current_price - position['entry_price']) / position['entry_price'] * 100
         
-        logger.info(f"SELL {symbol} ({asset_class}): {sell_quantity:.4f} @ ${current_price:.2f} | "
-                f"P&L: ${pnl:.2f} ({pnl_pct:.1f}%) | {reason}")
+        logger.info(f"SELL {symbol}: {sell_quantity:.6f} @ ${current_price:.2f} | "
+                   f"P&L: ${pnl:.2f} ({pnl_pct:.1f}%) | {reason}")
         
         if self.broker.place_order(order):
             trade = position['trade']
@@ -899,9 +922,8 @@ class TradingBot:
             trade.pnl = pnl
             trade.pnl_pct = pnl_pct
             trade.exit_reason = reason
-            
-            # Update trade with actual sold quantity
-            trade.quantity = sell_quantity
+            trade.quantity = sell_quantity  # Update with actual sold quantity
+            trade.actual_quantity = sell_quantity
             
             self.memory.update_trade(trade, position['trade_id'])
             
@@ -918,9 +940,9 @@ class TradingBot:
             
             del self.active_positions[symbol]
             return True
-        
-        return False
-
+        else:
+            logger.error(f"Failed to place sell order for {symbol}")
+            return False
 
     
     def check_stop_losses(self):
@@ -930,19 +952,19 @@ class TradingBot:
                 if current_price <= 0:
                     continue
                 
-                # Basic stop loss
+                # Tight stop loss
                 if current_price <= position['stop_loss']:
-                    logger.warning(f"STOP LOSS triggered for {symbol} @ ${current_price:.2f}")
-                    self.execute_sell(symbol, "Stop loss triggered")
+                    logger.warning(f"STOP LOSS: {symbol} @ ${current_price:.2f}")
+                    self.execute_sell(symbol, "Stop loss")
                     continue
                 
-                # Trailing stop for profitable positions
+                # Quick trailing stop for profitable positions
                 entry_price = position['entry_price']
                 profit_pct = (current_price - entry_price) / entry_price * 100
                 
-                if profit_pct > 5:  # Trail after 5% profit
+                if profit_pct > 2:  # Trail after 2% profit
                     asset_class = position['asset_class']
-                    trail_pct = 0.08 if asset_class == "crypto" else 0.06
+                    trail_pct = 0.04 if asset_class == "crypto" else 0.03  # Tighter trailing
                     new_stop = current_price * (1 - trail_pct)
                     
                     if new_stop > position['stop_loss']:
@@ -950,7 +972,6 @@ class TradingBot:
                         trade = position['trade']
                         trade.stop_loss = new_stop
                         self.memory.update_trade(trade, position['trade_id'])
-                        logger.info(f"Trailing stop updated for {symbol}: ${new_stop:.2f}")
                 
             except Exception as e:
                 logger.error(f"Error checking stop loss for {symbol}: {e}")
@@ -965,10 +986,12 @@ class TradingBot:
                 if asset_class == "stock" and not stock_market_open:
                     continue
                 
-                data = self.broker.get_bars(symbol, "15Min", 100)
-                if data.empty or len(data) < 50:
+                data = self.broker.get_bars(symbol, "5Min", 60)  # Faster bars
+                has_position = symbol in self.active_positions
+                asset_class = self._get_asset_class(symbol)
+                min_bars = 3 if (has_position and asset_class == "crypto") else (5 if has_position else 10)
+                if data.empty or len(data) < min_bars:
                     continue
-                
                 current_price = self.broker.get_current_price(symbol)
                 if current_price <= 0:
                     continue
@@ -997,9 +1020,8 @@ class TradingBot:
         stock_positions = {k: v for k, v in self.active_positions.items() if v['asset_class'] == 'stock'}
         crypto_positions = {k: v for k, v in self.active_positions.items() if v['asset_class'] == 'crypto'}
         
-        logger.info("=" * 70)
-        logger.info(f"TRADING BOT STATUS - {datetime.now().strftime('%H:%M:%S')}")
-        logger.info(self.market_hours.get_market_status_message())
+        logger.info("=" * 60)
+        logger.info(f"🚀 AGGRESSIVE BOT STATUS - {datetime.now().strftime('%H:%M:%S')}")
         logger.info(f"Portfolio: ${portfolio_value:,.2f} | P&L: ${self.total_pnl:.2f} | Win Rate: {win_rate:.1%} ({self.winning_trades}/{self.total_trades})")
         logger.info(f"Positions: {len(self.active_positions)}/{self.max_positions} | Stocks: {len(stock_positions)} | Crypto: {len(crypto_positions)}")
         
@@ -1022,77 +1044,33 @@ class TradingBot:
                 logger.info("  CRYPTO:")
                 for symbol, position in crypto_positions.items():
                     current_price = self.broker.get_current_price(symbol)
-                    unrealized_pnl = (current_price - position['entry_price']) * position['quantity']
+                    actual_qty = self.broker.get_actual_position_quantity(symbol)  # Use actual quantity
+                    unrealized_pnl = (current_price - position['entry_price']) * actual_qty
                     pnl_pct = (current_price - position['entry_price']) / position['entry_price'] * 100
                     hold_time = datetime.now() - position['timestamp']
                     
-                    logger.info(f"    {symbol}: {position['quantity']:.4f} @ ${position['entry_price']:.2f} | "
+                    logger.info(f"    {symbol}: {actual_qty:.6f} @ ${position['entry_price']:.2f} | "
                               f"Current: ${current_price:.2f} | P&L: ${unrealized_pnl:.2f} ({pnl_pct:.1f}%) | "
                               f"Stop: ${position['stop_loss']:.2f} | Hold: {str(hold_time).split('.')[0]}")
         
-        logger.info("=" * 70)
-    
-    def save_daily_performance(self):
-        try:
-            today = datetime.now().strftime('%Y-%m-%d')
-            account = self.broker.get_account()
-            portfolio_value = float(account.get('portfolio_value', self.initial_capital))
-            
-            today_trades = []
-            all_trades = self.memory.get_trade_history(days=1)
-            for trade in all_trades:
-                if trade.exit_timestamp and trade.exit_timestamp.startswith(today):
-                    today_trades.append(trade)
-            
-            daily_pnl = sum(trade.pnl for trade in today_trades)
-            daily_trade_count = len(today_trades)
-            win_rate = self.winning_trades / self.total_trades if self.total_trades > 0 else 0
-            
-            bot_state = self.memory.get_bot_state()
-            peak_value = max(bot_state.get('peak_portfolio_value', self.initial_capital), portfolio_value)
-            drawdown = (peak_value - portfolio_value) / peak_value if peak_value > 0 else 0
-            
-            if portfolio_value > bot_state.get('peak_portfolio_value', 0):
-                self.memory.update_bot_state(peak_portfolio_value=portfolio_value)
-            
-            self.memory.save_daily_performance(today, daily_pnl, daily_trade_count, win_rate, portfolio_value, drawdown)
-            
-            crypto_trades = len([t for t in today_trades if t.asset_class == "crypto"])
-            stock_trades = len([t for t in today_trades if t.asset_class == "stock"])
-            
-            logger.info(f"Daily performance saved: P&L=${daily_pnl:.2f}, Trades={daily_trade_count} (Stocks: {stock_trades}, Crypto: {crypto_trades})")
-            
-        except Exception as e:
-            logger.error(f"Error saving daily performance: {e}")
+        logger.info("=" * 60)
     
     def run(self):
-        logger.info("STARTING AGGRESSIVE CRYPTO+STOCK TRADING BOT")
-        logger.info("Using JSON file-based memory system")
-        logger.info(f"3% risk per trade | {self.max_positions} max positions | {self.check_interval}s intervals")
-        logger.info("Market hours checking enabled for CST timezone")
-        
-        logger.info(self.market_hours.get_market_status_message())
+        logger.info("🚀 STARTING AGGRESSIVE HIGH-FREQUENCY TRADING BOT 🚀")
+        logger.info(f"SMALL POSITIONS | HIGH LIMITS | 1% RISK | {self.max_positions} MAX POSITIONS | {self.check_interval}s INTERVALS")
         
         iteration = 0
-        last_daily_save = datetime.now().date()
-        last_market_status_log = datetime.now()
+        last_status_print = time.time()
         
         try:
             while True:
                 iteration += 1
                 start_time = time.time()
                 
-                # Log market status every hour
-                if (datetime.now() - last_market_status_log).total_seconds() >= 3600:
-                    logger.info(self.market_hours.get_market_status_message())
-                    last_market_status_log = datetime.now()
-                
-                if iteration % 5 == 0:  # Every 15 minutes
+                # Print status every 5 minutes
+                if time.time() - last_status_print >= 300:
                     self.print_status()
-                
-                if datetime.now().date() > last_daily_save:
-                    self.save_daily_performance()
-                    last_daily_save = datetime.now().date()
+                    last_status_print = time.time()
                 
                 self.check_stop_losses()
                 self.scan_markets()
@@ -1104,13 +1082,12 @@ class TradingBot:
                     time.sleep(sleep_time)
                 
         except KeyboardInterrupt:
-            logger.info("Trading stopped by user")
+            logger.info("🛑 Trading stopped by user")
         except Exception as e:
-            logger.error(f"Fatal error: {e}")
+            logger.error(f"💥 Fatal error: {e}")
         finally:
             self.print_status()
-            self.save_daily_performance()
-            logger.info("Bot shutdown complete")
+            logger.info("🏁 Bot shutdown complete")
 
 def main():
     API_KEY = os.getenv("ALPACA_API_KEY")
@@ -1122,25 +1099,22 @@ def main():
         logger.error("Missing API keys! Set ALPACA_API_KEY and ALPACA_SECRET_KEY")
         return
     
-    if PAPER_TRADING and not API_KEY.startswith('PK'):
-        logger.warning("Warning: Paper trading enabled but API key doesn't start with 'PK'")
-    
     try:
-        logger.info("Initializing aggressive crypto+stock trading bot...")
+        logger.info("🚀 Initializing AGGRESSIVE trading bot...")
         broker = AlpacaBroker(API_KEY, SECRET_KEY, paper_trading=PAPER_TRADING)
         
         account = broker.get_account()
         if not account or 'account_number' not in account:
-            logger.error("Failed to connect to Alpaca API. Cannot start bot.")
+            logger.error("❌ Failed to connect to Alpaca API")
             return
         
-        bot = TradingBot(broker, data_dir=DATA_DIR)
+        bot = AggressiveTradingBot(broker, data_dir=DATA_DIR)
         bot.run()
         
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("🛑 Bot stopped by user")
     except Exception as e:
-        logger.error(f"Fatal error in main: {e}")
+        logger.error(f"💥 Fatal error in main: {e}")
 
 if __name__ == "__main__":
     main()
